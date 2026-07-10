@@ -1,0 +1,338 @@
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 09.06.2026 11:22:38
+// Design Name: 
+// Module Name: round_robin_tb
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+
+
+package rr_pkg;
+    localparam int W = 4;   // *** change to 8 or 16 here too ***
+
+    //----------------------------------------------------------
+    // Transaction class
+    //----------------------------------------------------------
+    class RRTransaction;
+        rand logic [W-1:0] req;
+
+        // At least one requester active
+        constraint c_at_least_one {
+            req != 4'b0000;
+        }
+        // Weighted: all-ones 20%, single-bit M0 20%, rest 60%
+        // Using fixed literals - xsim cannot use W{} in dist
+        constraint c_distribution {
+            req dist {
+                4'b1111 := 20,
+                4'b0001 := 20,
+                [4'b0010 : 4'b1110] := 60
+            };
+        }
+    endclass
+
+
+    //----------------------------------------------------------
+    // Golden Reference Model
+    // Implements rotate ? priority-encode ? un-rotate
+    // Uses integer pointer (binary index) matching DUT
+    //----------------------------------------------------------
+    class GoldenModel;
+        int pointer;   // binary index 0..W-1
+
+        function new();
+            pointer = 0;
+        endfunction
+
+        function void reset_model();
+            pointer = 0;
+        endfunction
+
+        function logic [W-1:0] compute(input logic [W-1:0] req);
+            logic [W-1:0] req_rot;
+            logic [W-1:0] grant_rot;
+            logic [W-1:0] exp_grant;
+            logic         found;
+            int           granted_idx;
+
+            exp_grant   = '0;
+            grant_rot   = '0;
+            found       = 1'b0;
+            granted_idx = 0;
+
+            // Step 1: rotate req so pointer maps to position 0
+            for (int i = 0; i < W; i++)
+                req_rot[i] = req[(i + pointer) % W];
+
+            // Step 2: first-one priority encode on rotated vector
+            for (int i = 0; i < W; i++) begin
+                if (req_rot[i] && !found) begin
+                    grant_rot[i] = 1'b1;
+                    found        = 1'b1;
+                end
+            end
+
+            // Step 3: un-rotate back to original index ordering
+            for (int i = 0; i < W; i++)
+                exp_grant[(i + pointer) % W] = grant_rot[i];
+
+            // Advance pointer: (granted_index + 1) mod W
+            if (|req) begin
+                for (int i = 0; i < W; i++) begin
+                    if (exp_grant[i])
+                        granted_idx = i;
+                end
+                pointer = (granted_idx + 1) % W;
+            end
+            // else pointer holds
+
+            return exp_grant;
+        endfunction
+
+    endclass
+
+
+    //----------------------------------------------------------
+    // Checker class
+    //----------------------------------------------------------
+    class Checker;
+        int pass_count;
+        int fail_count;
+
+        function new();
+            pass_count = 0;
+            fail_count = 0;
+        endfunction
+
+        function void check(
+            input logic [W-1:0] req,
+            input logic [W-1:0] rtl_grant,
+            input logic         rtl_valid,
+            input logic [W-1:0] exp_grant,
+            input int           cycle
+        );
+            logic exp_valid;
+            exp_valid = (req != '0);
+
+            if (rtl_grant === exp_grant && rtl_valid === exp_valid) begin
+                pass_count++;
+                $display("[PASS] C%-3d | req=%04b | grant=%04b | valid=%0b",
+                         cycle, req, rtl_grant, rtl_valid);
+            end else begin
+                fail_count++;
+                $display("[FAIL] C%-3d | req=%04b | RTL=%04b valid=%0b | EXP=%04b valid=%0b",
+                         cycle, req, rtl_grant, rtl_valid, exp_grant, exp_valid);
+            end
+        endfunction
+
+        function void report();
+            $display("\n============================================");
+            $display("  WIDTH=%0d | PASSED: %0d | FAILED: %0d",
+                     W, pass_count, fail_count);
+            $display("  RESULT: %s",
+                     (fail_count == 0) ? "ALL TESTS PASSED" : "FAILURES DETECTED");
+            $display("============================================\n");
+        endfunction
+
+    endclass
+
+endpackage
+
+
+// ============================================================
+// Top module
+// In Vivado: Flow Navigator ? Simulation Settings ?
+//            set Simulation Top to "round_robin_tb"
+// ============================================================
+module round_robin_tb;
+
+    import rr_pkg::*;
+
+    localparam int TEST_WIDTH = 4;  // *** change to 8 or 16 ***
+
+    // Signals
+    logic                    clk  = 1'b0;
+    logic                    rst_n;
+    logic [TEST_WIDTH-1:0]   req;
+    logic [TEST_WIDTH-1:0]   grant;
+    logic                    grant_valid;
+
+    // grants_seen declared at module level (xsim fix [3])
+    logic [TEST_WIDTH-1:0]   grants_seen;
+
+    // 100 MHz clock
+    always #5 clk = ~clk;
+
+    // DUT
+    round_robin #(.WIDTH(TEST_WIDTH)) dut (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .req        (req),
+        .grant      (grant),
+        .grant_valid(grant_valid)
+    );
+
+    //----------------------------------------------------------
+    // SVA Assertions
+    //----------------------------------------------------------
+
+    // A1: grant must be one-hot or all-zero every cycle
+    property p_onehot;
+        @(posedge clk) disable iff (!rst_n)
+        (grant == '0) || $onehot(grant);
+    endproperty
+    assert property (p_onehot)
+        else $error("[SVA-A1] grant not one-hot | grant=%04b", grant);
+
+    // A2: grant_valid must equal (req != 0)
+    property p_valid_iff_req;
+        @(posedge clk) disable iff (!rst_n)
+        grant_valid == (req != '0);
+    endproperty
+    assert property (p_valid_iff_req)
+        else $error("[SVA-A2] grant_valid mismatch | req=%04b valid=%0b",
+                    req, grant_valid);
+
+    // A3: every granted bit must be a requested bit
+    property p_grant_in_req;
+        @(posedge clk) disable iff (!rst_n)
+        (grant != '0) |-> (|(grant & req));
+    endproperty
+    assert property (p_grant_in_req)
+        else $error("[SVA-A3] granted unrequested bit | grant=%04b req=%04b",
+                    grant, req);
+
+    // A4: no grant when req = 0
+    property p_no_spurious;
+        @(posedge clk) disable iff (!rst_n)
+        (req == '0) |-> (grant == '0);
+    endproperty
+    assert property (p_no_spurious)
+        else $error("[SVA-A4] spurious grant | grant=%04b", grant);
+
+    // A5: synchronous reset clears grant one cycle after rst_n=0
+    property p_sync_reset;
+        @(posedge clk)
+        (!rst_n) |=> (grant == '0 && grant_valid == 1'b0);
+    endproperty
+    assert property (p_sync_reset)
+        else $error("[SVA-A5] reset did not clear outputs");
+
+    //----------------------------------------------------------
+    // Test objects
+    //----------------------------------------------------------
+    RRTransaction txn;
+    GoldenModel   golden;
+    Checker       chk;
+    int           cycle_num;
+
+    // Drive req, wait posedge, compare
+    task automatic apply_and_check(input logic [TEST_WIDTH-1:0] r);
+        @(negedge clk);
+        req = r;
+        @(posedge clk); #1;
+        chk.check(req, grant, grant_valid, golden.compute(r), cycle_num);
+        cycle_num++;
+    endtask
+
+    //----------------------------------------------------------
+    // Stimulus
+    //----------------------------------------------------------
+    initial begin
+        txn       = new();
+        golden    = new();
+        chk       = new();
+        cycle_num = 0;
+
+        // ---- Synchronous Reset ----
+        rst_n = 1'b0;
+        req   = '0;
+        repeat(3) @(posedge clk);
+        @(negedge clk);
+        rst_n = 1'b1;
+        $display("\n=== WIDTH=%0d | Reset released ===\n", TEST_WIDTH);
+
+        // ---- T1: Constrained Random (3 x WIDTH cycles) ----
+        $display("--- T1: Constrained Random (%0d cycles) ---",
+                 3*TEST_WIDTH);
+        repeat(3*TEST_WIDTH) begin
+            if (!txn.randomize())
+                $fatal(1, "[ERROR] Randomization failed in T1");
+            apply_and_check(txn.req);
+        end
+
+        // ---- T2: Single requester per master ----
+        $display("\n--- T2: Single Requester per Master ---");
+        for (int m = 0; m < TEST_WIDTH; m++)
+            apply_and_check(TEST_WIDTH'(1 << m));
+
+        // ---- T3: All active - fairness check ----
+        $display("\n--- T3: All Active (%0d cycles - full rotation) ---",
+                 TEST_WIDTH);
+        grants_seen = '0;
+        repeat(TEST_WIDTH) begin
+            apply_and_check('1);
+            grants_seen = grants_seen | grant;
+        end
+        if (grants_seen == '1)
+            $display("[INFO] T3: All masters granted - fairness OK");
+        else
+            $display("[WARN] T3: grants_seen=%04b - not all masters served",
+                     grants_seen);
+
+        // ---- T4: Idle ----
+        $display("\n--- T4: Idle (req=0) ---");
+        apply_and_check('0);
+
+        // ---- T5: Alternating patterns ----
+        $display("\n--- T5: Alternating Patterns ---");
+        apply_and_check(4'b1010);
+        apply_and_check(4'b0101);
+        apply_and_check(4'b1100);
+        apply_and_check(4'b0011);
+
+        // ---- T6: Pointer hold during idle ----
+        $display("\n--- T6: Pointer Hold During Idle ---");
+        apply_and_check('1);          // establish pointer position
+        apply_and_check('0);          // idle - pointer must hold
+        apply_and_check('0);          // idle again
+        apply_and_check('1);          // resume - should continue rotation
+
+        // ---- T7: Mid-run reset and recovery ----
+        $display("\n--- T7: Mid-run Reset Recovery ---");
+        apply_and_check(4'b1010);
+        @(negedge clk);
+        rst_n = 1'b0;
+        req   = '0;
+        repeat(2) @(posedge clk);
+        @(negedge clk);
+        rst_n = 1'b1;
+        golden.reset_model();
+        $display("[INFO] T7: mid-run reset done, golden re-synced to pointer=0");
+        repeat(TEST_WIDTH) begin
+            if (!txn.randomize())
+                $fatal(1, "[ERROR] Randomization failed in T7");
+            apply_and_check(txn.req);
+        end
+
+        // ---- Final report ----
+        chk.report();
+        $finish;
+    end
+
+
+endmodule
+
